@@ -1,4 +1,4 @@
-name: Windows RDP with ZeroTier
+name: Windows RDP ZeroTier (24h Stable)
 on:
   workflow_dispatch:
 
@@ -9,16 +9,18 @@ jobs:
     - name: Setup environment
       shell: powershell
       run: |
-        Write-Host "Setting up environment..."
-        mkdir $env:GITHUB_WORKSPACE\zt
+        Write-Host "🔧 Setting up environment..."
+        mkdir $env:GITHUB_WORKSPACE\zt | Out-Null
         cd $env:GITHUB_WORKSPACE
+        Write-Host "✅ Environment ready."
 
     - name: Install ZeroTier
       shell: powershell
       run: |
+        Write-Host "⬇️ Installing ZeroTier..."
         Invoke-WebRequest https://download.zerotier.com/dist/ZeroTierOne.msi -OutFile zt.msi
         Start-Process msiexec.exe -Wait -ArgumentList '/i zt.msi /quiet /qn /norestart'
-        Write-Host "ZeroTier installed successfully"
+        Write-Host "✅ ZeroTier installed."
 
     - name: Join ZeroTier network
       shell: powershell
@@ -26,18 +28,20 @@ jobs:
         ZT_CENTRAL_TOKEN: ${{ secrets.ZT_CENTRAL_TOKEN }}
         ZT_NETWORK_ID: ${{ secrets.ZT_NETWORK_ID }}
       run: |
+        Write-Host "🔗 Joining ZeroTier network..."
         $cli = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.exe"
         & $cli join $env:ZT_NETWORK_ID
         Start-Sleep -Seconds 10
         & $cli listnetworks
-        Write-Host "✅ ZeroTier network joined"
+        Write-Host "✅ ZeroTier network joined."
 
     - name: Wait for ZeroTier IP & Print Summary
       shell: powershell
       run: |
+        Write-Host "🌐 Waiting for ZeroTier IP..."
         $cli = "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.exe"
         $ip = $null
-        for ($i=0; $i -lt 10; $i++) {
+        for ($i=0; $i -lt 15; $i++) {
           $nets = & $cli listnetworks
           if ($nets -match '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
             $ip = $matches[1]
@@ -52,19 +56,20 @@ jobs:
     - name: Create RDP file
       shell: powershell
       run: |
+        Write-Host "🧾 Creating RDP connection file..."
         $ip = Get-Content "$env:GITHUB_WORKSPACE\zt_ip.txt"
         $user = "runneradmin"
         $pass = "RDP@12345"
         $port = "3389"
         $file = "$env:GITHUB_WORKSPACE\connect_zerotier.rdp"
         $content = @"
-full address:s:$ip:$port
-username:s:$user
-prompt for credentials:i:1
-authentication level:i:2
-screen mode id:i:2
-desktopwidth:i:1280
-desktopheight:i:720
+       full address:s:$ip:$port
+       username:s:$user
+       prompt for credentials:i:1
+       authentication level:i:2
+       screen mode id:i:2
+       desktopwidth:i:1280
+       desktopheight:i:720
 "@
         $content | Out-File -FilePath $file -Encoding ascii
         Write-Host "✅ RDP file created: $file"
@@ -81,10 +86,10 @@ desktopheight:i:720
       shell: powershell
       run: |
         $secs = 86400
-        Write-Host "Keeping VM alive for $secs seconds (24h)..."
+        Write-Host "🕒 Keeping VM alive for 24h ($secs seconds)..."
         Start-Sleep -Seconds $secs
 
     - name: Cleanup
       shell: powershell
       run: |
-        Write-Host "Job finished. VM will terminate soon."
+        Write-Host "🧹 Job finished. VM will terminate soon."
