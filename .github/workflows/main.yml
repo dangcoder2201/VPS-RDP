@@ -1,0 +1,175 @@
+name: Windows RDP via ZeroTier (random creds + keep alive + scheduled restart)
+
+# Triggers:
+# - Manually via "Run workflow"
+# - Automatically every 6 hours to keep RDP available (start new runner each time)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'   # chạy mỗi 6 tiếng (0 phút của giờ chia hết 6)
+
+jobs:
+  zerotier-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360    # GitHub max ~6 giờ -> tối đa 360 phút
+    env:
+      ZT_NETWORK_ID: ${{ secrets.ZT_NETWORK_ID }}         # REQUIRED: Network ID (put in repo secrets)
+      ZT_CENTRAL_TOKEN: ${{ secrets.ZT_CENTRAL_TOKEN }}   # OPTIONAL: API token to auto-authorize node (put in secrets) 
+      KEEP_ALIVE_SECONDS: ${{ secrets.KEEP_ALIVE_SECONDS || '21600' }}  # default 6h (21600s). Do not exceed 21600.
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Create random RDP user & enable RDP
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # random username + password
+        $username = "u" + (Get-Random -Minimum 1000 -Maximum 99999)
+        $chars = ([char[]]([char]'0'..[char]'9') + [char[]]([char]'A'..[char]'Z') + [char[]]([char]'a'..[char]'z'))
+        $password = "P@" + ((1..10) | ForEach-Object { $chars | Get-Random }) -join ''
+        Write-Host "Creating local user: $username"
+        net user $username $password /add
+        net localgroup administrators $username /add
+
+        # enable RDP and firewall rules
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+        # Save creds
+        "$username`n$password" | Out-File -FilePath "$env:GITHUB_WORKSPACE\rdp_creds.txt" -Encoding ascii
+        Write-Host "✅ Created user and enabled RDP."
+
+    - name: Install ZeroTier
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Write-Host "Downloading ZeroTier..."
+        $msi = "ZeroTierOne.msi"
+        Invoke-WebRequest -Uri "https://download.zerotier.com/dist/ZeroTierOne.msi" -OutFile $msi -UseBasicParsing
+        Write-Host "Installing ZeroTier..."
+        Start-Process msiexec.exe -Wait -ArgumentList "/i $msi /qn"
+        Start-Sleep -Seconds 8
+
+    - name: Join ZeroTier network
+      shell: powershell
+      env:
+        ZT_NETWORK_ID: ${{ secrets.ZT_NETWORK_ID }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:ZT_NETWORK_ID) { Write-Error "ZT_NETWORK_ID secret missing"; exit 1 }
+        # locate zerotier-cli
+        $cliCandidates = @(
+          "C:\Program Files (x86)\ZeroTier\One\zerotier-cli.exe",
+          "C:\Program Files\ZeroTier\One\zerotier-cli.exe"
+        )
+        $cli = $cliCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $cli) { Write-Error "zerotier-cli not found after install"; exit 1 }
+        Write-Host "Using ZeroTier CLI: $cli"
+        & $cli join $env:ZT_NETWORK_ID
+        Start-Sleep -Seconds 8
+
+        # try get node id
+        $info = & $cli info 2>&1
+        Write-Host "zerotier info: $info"
+        if ($info -match '\b([0-9a-fA-F]{16,})\b') { $nodeId = $matches[1]; $nodeId | Out-File -FilePath "$env:GITHUB_WORKSPACE\zt_nodeid.txt" -Encoding ascii }
+        else { Write-Host "Could not parse node id; saving listnetworks for manual check"; & $cli listnetworks | Out-File -FilePath "$env:GITHUB_WORKSPACE\zt_listnetworks.txt" }
+
+    - name: (Optional) Auto-authorize node in ZeroTier Central
+      if: ${{ secrets.ZT_CENTRAL_TOKEN != '' }}
+      shell: powershell
+      env:
+        ZT_NETWORK_ID: ${{ secrets.ZT_NETWORK_ID }}
+        ZT_CENTRAL_TOKEN: ${{ secrets.ZT_CENTRAL_TOKEN }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $nodeFile = "$env:GITHUB_WORKSPACE\zt_nodeid.txt"
+        if (-not (Test-Path $nodeFile)) { Write-Host "No node id file found; skipping auto-authorize."; exit 0 }
+        $nodeId = (Get-Content $nodeFile -Raw).Trim()
+        if (-not $nodeId) { Write-Host "Empty node id; skip"; exit 0 }
+        $url = "https://my.zerotier.com/api/network/$($env:ZT_NETWORK_ID)/member/$nodeId"
+        $body = @{ config = @{ authorized = $true } } | ConvertTo-Json
+        try {
+          $resp = Invoke-RestMethod -Uri $url -Method PUT -Headers @{ Authorization = "Bearer $env:ZT_CENTRAL_TOKEN"; "Content-Type" = "application/json" } -Body $body -ErrorAction Stop
+          Write-Host "Auto-authorize response OK (truncated)."
+        } catch {
+          Write-Host "Auto-authorize failed: $($_.Exception.Message)"
+        }
+
+    - name: Wait for ZeroTier IP & print summary
+      shell: powershell
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $cliCandidates = @("C:\Program Files (x86)\ZeroTier\One\zerotier-cli.exe","C:\Program Files\ZeroTier\One\zerotier-cli.exe")
+        $cli = $cliCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $cli) { Write-Error "zerotier-cli not found"; exit 1 }
+
+        $ztIp = $null
+        for ($i=0; $i -lt 30; $i++) {
+          Start-Sleep -Seconds 3
+          $nets = & $cli listnetworks 2>&1
+          Write-Host "listnetworks (try $i):"
+          Write-Host $nets
+          if ($nets -match 'assignedAddresses\s*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') { $ztIp = $matches[1]; break }
+          if ($nets -match '([1-9][0-9]*\.[0-9]+\.[0-9]+\.[0-9]+)') { $ztIp = $matches[1]; break }
+        }
+
+        if (-not $ztIp) {
+          Write-Host "⚠️ Không lấy được IP tự động. Vui lòng vào https://my.zerotier.com và Authorize node, sau đó xem IP."
+          if (Test-Path "$env:GITHUB_WORKSPACE\zt_listnetworks.txt") { Write-Host "----- listnetworks -----"; Get-Content "$env:GITHUB_WORKSPACE\zt_listnetworks.txt" | Write-Host }
+          exit 0
+        }
+
+        Write-Host "✅ ZeroTier IP: $ztIp"
+        $ztIp | Out-File -FilePath "$env:GITHUB_WORKSPACE\zt_ip.txt" -Encoding ascii
+
+        $creds = Get-Content "$env:GITHUB_WORKSPACE\rdp_creds.txt"
+        Write-Host "========================================"
+        Write-Host "RDP Ready (ZeroTier)"
+        Write-Host "ZeroTier IP: $ztIp"
+        Write-Host "RDP Host (use this IP): $ztIp`:3389"
+        Write-Host "Username: $($creds[0])"
+        Write-Host "Password: $($creds[1])"
+        Write-Host "========================================"
+
+    - name: Create .rdp file and upload artifact
+      shell: powershell
+      run: |
+        if (-not (Test-Path "$env:GITHUB_WORKSPACE\zt_ip.txt")) { Write-Host "No ZeroTier IP found; skipping .rdp creation."; exit 0 }
+        $ip = Get-Content "$env:GITHUB_WORKSPACE\zt_ip.txt"
+        $creds = Get-Content "$env:GITHUB_WORKSPACE\rdp_creds.txt"
+        $username = $creds[0]; $password = $creds[1]
+        $hostport = "$ip`:3389"
+        $rdpfile = "$env:GITHUB_WORKSPACE\connect_zerotier_random.rdp"
+        $content = @"
+full address:s:$hostport
+username:s:$username
+prompt for credentials on client:i:1
+authentication level:i:2
+screen mode id:i:2
+desktopwidth:i:1280
+desktopheight:i:720
+"@
+        $content | Out-File -FilePath $rdpfile -Encoding ascii
+        Write-Host "Created .rdp at $rdpfile"
+
+    - name: Upload artifact (connect file)
+      uses: actions/upload-artifact@v4
+      with:
+        name: zerotier-rdp-connection
+        path: connect_zerotier_random.rdp
+
+    - name: Keep VM alive (sleep)
+      shell: powershell
+      run: |
+        $secs = [int]$env:KEEP_ALIVE_SECONDS
+        if ($secs -gt 21600) { Write-Host "WARNING: GitHub max single job runtime is ~6 hours (21600 seconds). Using 21600."; $secs = 21600 }
+        Write-Host "Keeping VM alive for $secs seconds."
+        Start-Sleep -Seconds $secs
+
+    - name: Cleanup note (always)
+      if: always()
+      shell: powershell
+      run: |
+        Write-Host "Job ending. If you used a reusable ZT_CENTRAL_TOKEN, consider revoking it when finished."
