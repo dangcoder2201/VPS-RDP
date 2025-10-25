@@ -1,12 +1,10 @@
 name: Windows RDP with ZeroTier
-
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
     - name: Setup environment
       shell: powershell
@@ -20,7 +18,7 @@ jobs:
       run: |
         Invoke-WebRequest https://download.zerotier.com/dist/ZeroTierOne.msi -OutFile zt.msi
         Start-Process msiexec.exe -Wait -ArgumentList '/i zt.msi /quiet /qn /norestart'
-        Write-Host "ZeroTier installed"
+        Write-Host "ZeroTier installed successfully"
 
     - name: Join ZeroTier network
       shell: powershell
@@ -32,7 +30,7 @@ jobs:
         & $cli join $env:ZT_NETWORK_ID
         Start-Sleep -Seconds 10
         & $cli listnetworks
-        Write-Host "ZeroTier network joined"
+        Write-Host "✅ ZeroTier network joined"
 
     - name: Wait for ZeroTier IP & Print Summary
       shell: powershell
@@ -51,7 +49,7 @@ jobs:
         Write-Host "✅ ZeroTier IP: $ip"
         $ip | Out-File "$env:GITHUB_WORKSPACE\zt_ip.txt" -Encoding ascii
 
-    - name: Create .rdp file
+    - name: Create RDP file
       shell: powershell
       run: |
         $ip = Get-Content "$env:GITHUB_WORKSPACE\zt_ip.txt"
@@ -70,6 +68,8 @@ desktopheight:i:720
 "@
         $content | Out-File -FilePath $file -Encoding ascii
         Write-Host "✅ RDP file created: $file"
+        Write-Host "Username: $user"
+        Write-Host "Password: $pass"
 
     - name: Upload RDP File
       uses: actions/upload-artifact@v4
@@ -77,11 +77,11 @@ desktopheight:i:720
         name: rdp-zerotier
         path: connect_zerotier.rdp
 
-    - name: Keep VM alive
+    - name: Keep VM alive (24h)
       shell: powershell
       run: |
-        $secs = 86400  # 24h
-        Write-Host "Keeping VM alive for $secs seconds..."
+        $secs = 86400
+        Write-Host "Keeping VM alive for $secs seconds (24h)..."
         Start-Sleep -Seconds $secs
 
     - name: Cleanup
